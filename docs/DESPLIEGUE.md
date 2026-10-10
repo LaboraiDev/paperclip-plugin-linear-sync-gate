@@ -12,6 +12,7 @@
 | Resolución de secretos y llamada a Linear con `ctx.http.fetch` | Sí (con credenciales falsas Linear responde 401 y la ejecución queda `failed` con ese mensaje, sin secretos) |
 | Lecturas de Paperclip (`issues.list`, `issues.get`, `issues.relations.get`) | Funcionan. Ojo: `issues.get` **no** trae `blockedBy` en esta versión; se usa `issues.relations.get` |
 | Webhook `bearer` con `setupPending: true` | `202 {"status":"test_received","test":true,"routineStarted":false}` |
+| Respuesta del webhook en modo real (leído en el código del servidor 2026.1005.0, sin disparar) | `202` con la ejecución de la rutina en el nivel superior; `status` puede ser `received`, `issue_created`, `completed`, `coalesced`, `skipped` o `failed`. Solo `received`, `issue_created` y `completed` cuentan como entregadas |
 | `ctx.http.fetch` a `localhost` o IP privada | **Bloqueado por el host (SSRF)**. `webhookUrl` debe ser la URL pública `https://paperclip.projectllama.cloud/api/routine-triggers/public/<id>/fire` (resuelve a IP pública, y el endpoint responde sin login; comprobado con un id inexistente → 404 de Paperclip) |
 
 No verificado en local (requiere credenciales reales de Linear): las consultas reales a Linear y el disparo extremo a extremo. Eso es justo lo que valida la fase 3.
@@ -22,7 +23,24 @@ No verificado en local (requiere credenciales reales de Linear): las consultas r
 2. Hacer push de `main`. El workflow `ci` pasa typecheck, tests y build.
 3. Hacer push del tag `v0.1.0`. El workflow publica `@laboraidev/paperclip-plugin-linear-sync-gate@0.1.0` en GitHub Packages con el `GITHUB_TOKEN` del workflow.
 
-## Fase 2 — Instalar en modo prueba (sin efecto en producción)
+## Fase 2 — Instalar en modo prueba
+
+**Efecto en producción:** el webhook en `setupPending` nunca crea ejecuciones ni despierta al agente. Pero desde que se pone `enabled: true`, el plugin **sí** usa las credenciales reales de la app de Linear: en cada comprobación pide un token y lo revoca. Por eso, antes de activarlo, hay que hacer la comprobación previa.
+
+### 2.0 Comprobaciones previas (Jesús, una sola vez)
+
+1. **La revocación de un token no afecta a los demás.** Desde cualquier máquina:
+   ```bash
+   LINEAR_CLIENT_ID=... LINEAR_CLIENT_SECRET=... ./scripts/verify-linear-revoke.sh
+   ```
+   Tiene que terminar en `OK`. Si dice `STOP`, **no se activa**: hay que quitar la revocación del plugin y publicar otra versión.
+2. **El VPS resuelve el dominio a la IP pública.** En el VPS:
+   ```bash
+   getent hosts paperclip.projectllama.cloud
+   ```
+   Tiene que dar `51.75.203.215` (u otra IP pública), no `127.x`, `10.x`, `172.16–31.x` ni `192.168.x`. Si diera una IP privada, el guard SSRF de Paperclip bloquearía el disparo.
+
+### 2.1 Instalar
 
 **En el VPS (Jesús), con el usuario que ejecuta Paperclip:**
 
@@ -64,6 +82,13 @@ La rutina original sigue igual, cada 30 minutos. Comparo dos fuentes:
 Criterio:
 - si la original encontró trabajo, el plugin tuvo que disparar;
 - si el plugin no disparó, la original no tuvo que encontrar nada.
+
+Para que la observación pruebe algo aunque el día sea tranquilo:
+- **Mención de prueba (Jesús):** durante la observación, una mención deliberada en una issue de prueba con «Ready for AI». Lo esperado:
+  - en ≤5 min, el `lastWebhookDelivery` del disparador muestra `test_received`;
+  - la rutina original responde en su siguiente pasada.
+- **Ejecuciones de la tarea del plugin:** tienen que salir `succeeded`, no `failed` (un 401 o 403 de Linear, o un error SSRF, aparecen ahí).
+- **Disparos por bloqueos sin enlace a Linear:** contar cuántos disparos `blocked:` corresponden a tareas sin issue de Linear. Hoy hay 15 tareas manuales así, y cada disparo de este tipo es una ejecución de ~0,50 USD para nada. Si salen muchos, se añade un filtro a C antes de activar.
 
 ## Fase 4 — Activar (con tu OK), en este orden
 

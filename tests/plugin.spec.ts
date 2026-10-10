@@ -79,7 +79,8 @@ async function harnessWith(issues: Issue[] = []): Promise<TestHarness> {
   return harness;
 }
 
-const accepted = () => ({ status: 202, body: { run: { status: "queued" } } });
+// Shape returned by the 2026.1005.0 public fire route: the routine run row itself.
+const accepted = () => ({ status: 202, body: { id: "run-1", status: "issue_created" } });
 const mention = { identifier: "DEV-1", comments: { nodes: [{ id: "c1", body: "@Paperclip ¿?", createdAt: "2026-10-10T10:00:00Z", user: { id: "u1" } }] } };
 
 describe("linear sync gate job", () => {
@@ -126,12 +127,23 @@ describe("linear sync gate job", () => {
     expect(calls.webhook).toHaveLength(1);
   });
 
-  it("retries on the next check when the delivery was coalesced into a running routine", async () => {
-    let status = "coalesced";
-    const calls = stubFetch({ mentionIssues: [], todo: ["DEV-2"] }, () => ({ status: 202, body: { run: { status } } }));
+  it.each(["coalesced", "skipped", "failed"])("retries on the next check when the run status is %s", async (first) => {
+    let status = first;
+    const calls = stubFetch({ mentionIssues: [], todo: ["DEV-2"] }, () => ({ status: 202, body: { id: "run-1", status } }));
     const harness = await harnessWith();
     await harness.runJob(CHECK_JOB_KEY);
-    status = "queued";
+    status = "issue_created";
+    await harness.runJob(CHECK_JOB_KEY);
+    await harness.runJob(CHECK_JOB_KEY);
+    expect(calls.webhook).toHaveLength(2);
+  });
+
+  it("retries on the next check when the webhook answers an HTTP error (e.g. 409 paused routine)", async () => {
+    let status = 409;
+    const calls = stubFetch({ mentionIssues: [], todo: ["DEV-2"] }, () => ({ status, body: { error: "Routine trigger is not active" } }));
+    const harness = await harnessWith();
+    await harness.runJob(CHECK_JOB_KEY);
+    status = 202;
     await harness.runJob(CHECK_JOB_KEY);
     expect(calls.webhook).toHaveLength(2);
   });

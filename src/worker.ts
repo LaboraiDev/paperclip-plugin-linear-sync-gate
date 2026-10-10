@@ -75,15 +75,18 @@ async function fireWebhook(
       items,
     }),
   });
-  const body = (await response.json().catch(() => null)) as { status?: string; test?: boolean; run?: { status?: string } } | null;
+  // 2026.1005.0 answers 202 with the routine run itself (`{ id, status, ... }`),
+  // or `{ status: "test_received", test: true }` while the trigger is in setup mode.
+  const body = (await response.json().catch(() => null)) as { status?: string; test?: boolean } | null;
   if (!response.ok) return { delivered: false, outcome: `http-${response.status}` };
-  // Setup mode (`setupPending: true`) answers `test_received` and never starts a run.
   if (body?.test === true || body?.status === "test_received") return { delivered: true, outcome: "test_received" };
-  const runStatus = body?.run?.status ?? body?.status ?? "accepted";
-  // A coalesced/skipped delivery was folded into a run that may predate this
-  // work: keep state untouched so the next check fires again.
-  if (runStatus === "coalesced" || runStatus === "skipped") return { delivered: false, outcome: runStatus };
-  return { delivered: true, outcome: runStatus };
+  const runStatus = body?.status ?? "unknown";
+  // coalesced/skipped: folded into a run that may predate this work.
+  // failed/ignored/unknown: no run handled it. Keep state so the next check fires again.
+  if (runStatus === "received" || runStatus === "issue_created" || runStatus === "completed") {
+    return { delivered: true, outcome: runStatus };
+  }
+  return { delivered: false, outcome: runStatus };
 }
 
 export async function checkCompany(ctx: PluginContext, companyId: string, job: PluginJobContext, nowMs = Date.now()): Promise<void> {
