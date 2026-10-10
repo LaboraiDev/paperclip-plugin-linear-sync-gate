@@ -1,0 +1,42 @@
+{
+  "name": "@laboraidev/paperclip-plugin-linear-sync-gate",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Paperclip plugin: wakes the Linear sync routine only when Linear or Paperclip has pending work.",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LaboraiDev/paperclip-plugin-linear-sync-gate.git"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "engines": {
+    "node": ">=24.11.0"
+  },
+  "files": [
+    "dist"
+  ],
+  "paperclipPlugin": {
+    "manifest": "./dist/manifest.js",
+    "worker": "./dist/worker.js"
+  },
+  "scripts": {
+    "build": "node ./esbuild.config.mjs",
+    "test": "vitest run --config ./vitest.config.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "paperclip",
+    "plugin",
+    "automation"
+  ],
+  "author": "Laborai",
+  "devDependencies": {
+    "@paperclipai/plugin-sdk": "2026.1005.0",
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.27.3",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.5"
+  }
+}
