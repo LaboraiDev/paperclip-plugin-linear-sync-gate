@@ -60,20 +60,20 @@ function stubFetch(linear: LinearFixture, webhookResponse: () => { status: numbe
   return calls;
 }
 
-const blockedIssue = (id: string, labels: string[] = [], blockedBy: string[] = []) =>
+const blockedIssue = (id: string, labels: string[] = [], status = "blocked") =>
   ({
     id,
     companyId: COMPANY,
     identifier: id.toUpperCase(),
     title: id,
-    status: "blocked",
+    status,
     assigneeAgentId: AGENT,
     labels: labels.map((name) => ({ id: name, companyId: COMPANY, name })),
-    blockedBy: blockedBy.map((blocker) => ({ id: blocker, identifier: blocker, title: blocker, status: "in_review" })),
   }) as unknown as Issue;
 
 async function harnessWith(issues: Issue[] = []): Promise<TestHarness> {
-  const harness = createTestHarness({ manifest, config });
+  // `issue.relations.write` only lets the test wire blockers; the plugin never writes.
+  const harness = createTestHarness({ manifest, config, capabilities: [...manifest.capabilities, "issue.relations.write"] });
   harness.seed({ companies: [{ id: COMPANY, name: "Laborai" } as unknown as Company], issues });
   await plugin.definition.setup(harness.ctx);
   return harness;
@@ -153,6 +153,16 @@ describe("linear sync gate job", () => {
     await harness.runJob(CHECK_JOB_KEY);
     expect(calls.webhook).toHaveLength(1);
     expect(calls.webhook[0].body.items).toEqual(["blocked:new"]);
+  });
+
+  it("excludes a blocked task whose direct blocker is waiting for a prototype merge", async () => {
+    const calls = stubFetch({ mentionIssues: [], todo: [] }, accepted);
+    const harness = await harnessWith([]);
+    await harness.runJob(CHECK_JOB_KEY); // baseline (empty)
+    harness.seed({ issues: [blockedIssue("parent"), blockedIssue("prototype-pr", ["awaiting-prototype-merge"], "in_review")] });
+    await harness.ctx.issues.relations.setBlockedBy("parent", ["prototype-pr"], COMPANY);
+    await harness.runJob(CHECK_JOB_KEY);
+    expect(calls.webhook).toHaveLength(0);
   });
 
   it("does nothing for a company that has not enabled the gate", async () => {

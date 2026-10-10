@@ -23,7 +23,11 @@ async function readState(ctx: PluginContext, companyId: string): Promise<GateSta
   return { seenBlocked: stored?.seenBlocked ?? null, lastFire: stored?.lastFire ?? null };
 }
 
-/** Blocked tasks of the agent, each with its own labels plus its direct blockers' labels. */
+/**
+ * Blocked tasks of the agent, each with its own labels plus its direct
+ * blockers' labels. In Paperclip 2026.1005.0 the plugin `issues.get` returns
+ * labels but not `blockedBy`, so blockers come from `issues.relations.get`.
+ */
 async function loadBlockedTasks(ctx: PluginContext, companyId: string, agentId: string): Promise<BlockedTask[]> {
   const blocked: Issue[] = [];
   for (let offset = 0; ; offset += PAGE_SIZE) {
@@ -39,7 +43,8 @@ async function loadBlockedTasks(ctx: PluginContext, companyId: string, agentId: 
   const tasks: BlockedTask[] = [];
   for (const summary of blocked) {
     const issue = (await getIssue(summary.id)) ?? summary;
-    const blockers = await Promise.all((issue.blockedBy ?? []).map((blocker) => getIssue(blocker.id)));
+    const { blockedBy } = await ctx.issues.relations.get(issue.id, companyId);
+    const blockers = await Promise.all(blockedBy.map((blocker) => getIssue(blocker.id)));
     const labelNames = [issue, ...blockers].flatMap((item) => (item?.labels ?? []).map((label) => label.name));
     tasks.push({ id: issue.id, identifier: issue.identifier, labelNames });
   }
@@ -88,6 +93,8 @@ export async function checkCompany(ctx: PluginContext, companyId: string, job: P
     return;
   }
   const config = parsed.config;
+  // Cheap internal reads first; Linear (network) last.
+  const blockedTasks = await loadBlockedTasks(ctx, companyId, config.agentId);
   const fetch = (url: string, init?: RequestInit) => ctx.http.fetch(url, init);
   const [clientId, clientSecret] = await Promise.all([
     ctx.secrets.resolve(config.linearClientId, { companyId, configPath: "linearClientId" }),
@@ -110,7 +117,7 @@ export async function checkCompany(ctx: PluginContext, companyId: string, job: P
   });
 
   const state = await readState(ctx, companyId);
-  const delta = blockedDelta(await loadBlockedTasks(ctx, companyId, config.agentId), state.seenBlocked, config.awaitingMergeLabel);
+  const delta = blockedDelta(blockedTasks, state.seenBlocked, config.awaitingMergeLabel);
   const work: PendingWork = { mentions: linear.mentions, intake: linear.intake, newlyBlocked: delta.newlyBlocked };
   const decision = decide(work, state.lastFire, nowMs, config.refireMinutes * 60_000);
   const counts = { mentions: work.mentions.length, intake: work.intake.length, newlyBlocked: work.newlyBlocked.length };
