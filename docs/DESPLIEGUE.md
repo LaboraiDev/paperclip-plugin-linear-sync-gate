@@ -8,9 +8,10 @@
 |---|---|
 | SDK = producción | `@paperclipai/plugin-sdk@2026.1005.0`, construido sobre el commit `467125f`, el que devuelve `/api/health` de producción |
 | Eventos en ese commit | `issue.created`, `issue.updated` (con `status` y `_previous.status` en los dos caminos leídos), `issue.comment.created` (solo 120 caracteres del texto: el plugin lee el comentario completo) e `issue.relations.updated`. Leído en el código público de `467125f` |
-| Ruta de webhooks de plugins en producción | `POST /api/plugins/laboraidev.paperclip-plugin-linear-sync-gate/webhooks/linear` → `400 "Plugin does not have the webhooks.receive capability"` con la v0.1.0. La ruta está activa, es pública y llega al plugin |
-| Firma de Linear | HMAC-SHA256 en hex del cuerpo crudo en `Linear-Signature`, más `webhookTimestamp` dentro de 60 s (documentación de Linear) |
-| Tests | `pnpm typecheck`, `pnpm test` (56 tests, incluido el caso LAB-5055 por barrida y solo por eventos) y `pnpm build` en verde |
+| Ruta de webhooks de plugins en producción | `POST /api/plugins/laboraidev.paperclip-plugin-linear-sync-gate/webhooks/linear` → `400 "Plugin does not have the webhooks.receive capability"` con la v0.1.0. La ruta está activa y es pública, y Paperclip resuelve el plugin instalado. El 400 lo da Paperclip **antes** de llamar al plugin |
+| Firma y entrega de Linear | HMAC-SHA256 en hex del cuerpo crudo en `Linear-Signature`, más `webhookTimestamp` dentro de 60 s. Linear espera 5 s y reintenta 3 veces (1 min, 1 h, 6 h); si sigue fallando puede desactivar el webhook. Por eso el plugin solo verifica y encola, y responde enseguida (documentación de Linear) |
+| Límite de Linear | 5.000 llamadas/hora para una app OAuth. Cada barrida registra `linearCalls` en su log |
+| Tests | Comprobación de tipos, 62 tests (incluido el caso LAB-5055 por barrida y solo por eventos) y build en verde. Se ejecutaron con los binarios locales (`tsc`, `vitest`, `esbuild`) porque `pnpm` no está instalado en esta máquina |
 
 ## Fase 2 — Instancia aislada construida desde el commit `467125f` (igual que la v0.1.0)
 
@@ -39,7 +40,7 @@ Lo que el arnés de tests del SDK **no** puede probar:
    - recursos: Issues, Comments, Issue labels;
    - equipo DEV;
    - guardar el secreto de firma como secreto de Paperclip y ponerlo en `linearWebhookSecret`.
-5. Repetir el `curl` de comprobación. Ahora la respuesta debe ser `200` (el plugin la recibe) y en los logs debe aparecer «Linear webhook rejected: no enabled company's secret matches the signature».
+5. Repetir el `curl` de comprobación. Ya **no** debe responder `400 … webhooks.receive capability`. En los logs del plugin debe aparecer «Linear webhook rejected: no enabled company's secret matches the signature», porque el `curl` no va firmado. No se ha leído qué código HTTP devuelve Paperclip en ese caso: anótalo.
 6. Durante 24–48 h, revisar:
    - logs «Linear sync (observe): would apply» y el estado `observed`;
    - el número de la primera pasada («adopted the current state…»);

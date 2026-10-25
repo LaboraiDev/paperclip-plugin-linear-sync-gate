@@ -124,9 +124,12 @@ export class FakeLinear {
     }
     if (query.includes("issue(id: $id) { comments")) {
       const issue = this.find(variables.id);
-      const nodes = (issue?.comments ?? [])
+      const start = variables.after ? Number(variables.after) : 0;
+      const all = (issue?.comments ?? [])
         .map((comment) => ({ id: comment.id, body: comment.body, createdAt: comment.createdAt, parent: comment.parentId ? { id: comment.parentId } : null, user: comment.user }));
-      return json(200, { data: { issue: issue ? { comments: { nodes } } : null } });
+      const nodes = all.slice(start, start + 100);
+      const pageInfo = { hasNextPage: start + 100 < all.length, endCursor: String(start + 100) };
+      return json(200, { data: { issue: issue ? { comments: { nodes, pageInfo } } : null } });
     }
     if (query.includes("issue(id: $id)")) {
       const issue = this.find(variables.id);

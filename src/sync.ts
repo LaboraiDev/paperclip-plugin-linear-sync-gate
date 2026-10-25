@@ -8,6 +8,7 @@ import { pendingMentions, type LinearSelf } from "./gate.js";
 import type { LinearIssue, LinearSession } from "./linear.js";
 import { findLinkedRoot, loadLinks, RESCAN_MS, rootsByLinearIssue, saveLinks, scanRoots, type LinkStore } from "./links.js";
 import {
+  descendantsOf,
   diagnoseBlocked,
   emptyPublished,
   fixFollowUps,
@@ -108,6 +109,8 @@ export interface SweepReport {
   newLinks: string[];
   unresolvedLinks: string[];
   effects: ReturnType<EffectRunner["counts"]>;
+  /** Linear GraphQL calls this sweep made (Linear allows 5,000/hour for an OAuth app). */
+  linearCalls: number;
 }
 
 /** Full pass: refresh links, intake, reconcile every linked issue, answer mentions on unlinked issues. */
@@ -130,7 +133,7 @@ export async function runSweep(sync: SyncContext): Promise<SweepReport> {
     await reconcileLinearIssue(sync, linearIssueId, rootIds, []);
   }
   await answerUnlinkedMentions(sync, new Set(groups.keys()));
-  return { linkedIssues: groups.size, newLinks, unresolvedLinks, effects: sync.runner.counts() };
+  return { linkedIssues: groups.size, newLinks, unresolvedLinks, effects: sync.runner.counts(), linearCalls: sync.linear.calls() };
 }
 
 /** Paperclip tasks changed: reconcile each Linear issue they belong to, once. */
@@ -290,6 +293,7 @@ export async function reconcileLinearIssue(sync: SyncContext, linearIssueId: str
   };
 
   // 1. Diagnose every blocked task in the subtree, whoever it is assigned to.
+  const descendants = descendantsOf(tasks);
   const diagnoses: Diagnosis[] = [];
   for (const task of tasks.filter((candidate) => candidate.status === "blocked")) {
     const full = await fullIssue(task.id);
@@ -312,27 +316,37 @@ export async function reconcileLinearIssue(sync: SyncContext, linearIssueId: str
         productLabel: config.productLabel,
         staleMinutes: config.staleMinutes,
         nowMs: sync.nowMs,
-        subtreeIds: new Set(issuesById.keys()),
+        descendantIds: descendants.get(task.id),
       }),
     );
   }
 
   // 2. Self-healing: finished fix tasks, missing relations, plain-text handoffs.
   const resumed = new Set<string>();
-  const resume = async (target: TaskView, keyBase: string, paperclipBody: string, cause: string) => {
+  /** Resumed tasks already explained in Linear: no extra "Desbloqueada" for them. */
+  const announcedResumes = new Set<string>();
+  const resume = async (target: TaskView, keyBase: string, paperclipBody: string, cause: string, announce: boolean) => {
     if (target.status === "blocked") await runner.run({ kind: "paperclip.status", key: `${keyBase}:status`, issueId: target.id, status: "todo" });
     await runner.run({ kind: "paperclip.comment", key: `${keyBase}:comment`, issueId: target.id, body: paperclipBody });
     await runner.run({ kind: "paperclip.wakeup", key: `${keyBase}:wake`, issueId: target.id, reason: cause });
-    await runner.run({
-      kind: "linear.comment",
-      key: `${keyBase}:linear`,
-      linearIssueId,
-      body: resumedNotice({ task: refOf(target), cause, key: keyBase }),
-    });
+    if (announce) {
+      await runner.run({
+        kind: "linear.comment",
+        key: `${keyBase}:linear`,
+        linearIssueId,
+        body: resumedNotice({ task: refOf(target), cause, key: keyBase }),
+      });
+      announcedResumes.add(target.id);
+    }
     resumed.add(target.id);
   };
 
-  const followUps = fixFollowUps(tasks, new Map([...blockedBy].map(([id, list]) => [id, list.map((blocker) => blocker.id)])));
+  const followUps = fixFollowUps(
+    tasks,
+    new Map([...blockedBy].map(([id, list]) => [id, list.map((blocker) => blocker.id)])),
+    sync.nowMs,
+    config.staleMinutes * 60_000,
+  );
   for (const missing of followUps.missingRelations) {
     await runner.run({
       kind: "paperclip.blockers",
@@ -341,11 +355,11 @@ export async function reconcileLinearIssue(sync: SyncContext, linearIssueId: str
       add: [missing.blockerTaskId],
     });
   }
-  for (const { taskId, fixTaskId } of followUps.resumes) {
+  for (const { taskId, fixTaskId, announce } of followUps.resumes) {
     const target = tasksById.get(taskId)!;
     const fix = tasksById.get(fixTaskId)!;
     const keyBase = `resume:${taskId}:${fixTaskId}`;
-    await resume(target, keyBase, resumeComment({ fix: refOf(fix), key: keyBase }), `${fix.identifier ?? "La tarea de arreglo"} ya terminó y nadie avisó a esta tarea.`);
+    await resume(target, keyBase, resumeComment({ fix: refOf(fix), key: keyBase }), `${fix.identifier ?? "La tarea de arreglo"} ya terminó y nadie avisó a esta tarea.`, announce);
   }
 
   const handoffSources = tasks.filter(
@@ -363,6 +377,7 @@ export async function reconcileLinearIssue(sync: SyncContext, linearIssueId: str
           keyBase,
           handoffComment({ agentId: handoff.agentId, agentName: handoff.agentName, from: refOf(source), quote: comment.body, key: keyBase }),
           `${source.identifier ?? "Otra tarea"} le devolvió el trabajo a ${handoff.agentName} nombrándola sin mencionarla.`,
+          true,
         );
       }
     }
@@ -379,12 +394,16 @@ export async function reconcileLinearIssue(sync: SyncContext, linearIssueId: str
       .filter((comment) => relayCursor === null || comment.createdAt > relayCursor)
       .filter((comment) => comment.user?.id !== sync.self.id && !hasPluginMarker(comment.body) && (comment.body ?? "").trim() !== "")
       .sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
+    const open = diagnoses.filter((diagnosis) => !resumed.has(diagnosis.taskId));
     for (const comment of fresh) {
-      const targetId = relayTarget(diagnoses.filter((diagnosis) => !resumed.has(diagnosis.taskId)), roots);
+      const targetId = relayTarget(open, roots);
       if (!targetId) break;
       const email = comment.user?.email?.toLowerCase() ?? null;
       const mapped = email ? config.userMap[email] : undefined;
-      if (tasksById.get(targetId)?.status === "blocked") {
+      // A human answer only lifts a block that was waiting on a person (or on nobody in particular).
+      // Blocked on a task or another agent: the comment alone wakes the assignee; the block stays.
+      const waiting = open.find((diagnosis) => diagnosis.taskId === targetId)?.waitingOn.kind;
+      if (tasksById.get(targetId)?.status === "blocked" && (waiting === "human" || waiting === "unknown")) {
         await runner.run({ kind: "paperclip.status", key: `relay:${comment.id}:status`, issueId: targetId, status: "todo" });
       }
       const relayed = await runner.run({
@@ -456,6 +475,7 @@ export async function reconcileLinearIssue(sync: SyncContext, linearIssueId: str
         }),
       });
     } else if (notice.kind === "unblock") {
+      if (announcedResumes.has(notice.taskId)) continue;
       await runner.run({ kind: "linear.comment", key: `unblock:${notice.episode}`, linearIssueId, body: unblockNotice({ task: refOf(tasksById.get(notice.taskId)), episode: notice.episode }) });
     } else if (notice.kind === "stuck") {
       await runner.run({

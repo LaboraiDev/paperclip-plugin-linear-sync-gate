@@ -61,7 +61,12 @@ export interface LinearSession {
   createComment(input: { id: string; issueId: string; body: string; parentId?: string | null }): Promise<{ alreadyExisted: boolean }>;
   updateLabels(issueId: string, change: { add?: string[]; remove?: string[] }): Promise<void>;
   setState(issueId: string, teamId: string, stateName: string): Promise<void>;
+  /** GraphQL calls made in this session (Linear allows 5,000/hour for an OAuth app). */
+  calls(): number;
 }
+
+/** Comments are paged through to the end: Linear's docs do not say which 100 come first. */
+const MAX_COMMENT_PAGES = 10;
 
 /**
  * Mint a client_credentials token, run `work`, and always revoke the token,
@@ -139,7 +144,10 @@ const ISSUE_FIELDS = "id identifier url title description state { name type } la
 function createSession(fetch: Fetch, token: string): LinearSession {
   type GqlErrors = Array<{ message?: string; extensions?: { userPresentableMessage?: string } }>;
 
+  let callCount = 0;
+
   async function request<T>(query: string, variables: Record<string, unknown>): Promise<{ status: number; ok: boolean; data?: T; errors?: GqlErrors }> {
+    callCount += 1;
     const response = await fetch(LINEAR_GRAPHQL_URL, {
       method: "POST",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
@@ -203,11 +211,20 @@ function createSession(fetch: Fetch, token: string): LinearSession {
     },
 
     async issueComments(issueId) {
-      const data = await gql<{ issue: { comments: { nodes: LinearIssueComment[] } } | null }>(
-        "query($id: String!) { issue(id: $id) { comments(first: 100, orderBy: createdAt) { nodes { id body createdAt parent { id } user { id name email } } } } }",
-        { id: issueId },
-      );
-      return data.issue?.comments.nodes ?? [];
+      type Page = { issue: { comments: { nodes: LinearIssueComment[]; pageInfo: { hasNextPage: boolean; endCursor: string | null } } } | null };
+      const comments: LinearIssueComment[] = [];
+      let after: string | null = null;
+      for (let page = 0; page < MAX_COMMENT_PAGES; page += 1) {
+        const data: Page = await gql<Page>(
+          "query($id: String!, $after: String) { issue(id: $id) { comments(first: 100, after: $after, orderBy: createdAt) { nodes { id body createdAt parent { id } user { id name email } } pageInfo { hasNextPage endCursor } } } }",
+          { id: issueId, after },
+        );
+        if (!data.issue) break;
+        comments.push(...data.issue.comments.nodes);
+        if (!data.issue.comments.pageInfo.hasNextPage) break;
+        after = data.issue.comments.pageInfo.endCursor;
+      }
+      return comments;
     },
 
     // Same lookup as `mention email:<address>`: the profile URL is the mention.
@@ -270,5 +287,7 @@ function createSession(fetch: Fetch, token: string): LinearSession {
         input: { stateId: state.id },
       });
     },
+
+    calls: () => callCount,
   };
 }

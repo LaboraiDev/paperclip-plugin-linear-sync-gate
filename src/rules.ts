@@ -52,8 +52,9 @@ export interface Diagnosis {
   /** Waiting for a prototype merge (own label or a direct blocker's): never shown as Blocked in Linear. */
   excluded: boolean;
   /**
-   * Only waiting for other open tasks of the same synced subtree (a parent
-   * waiting for its subtasks): normal progress, not news for Linear.
+   * Only waiting for its own open subtasks (a parent waiting for its
+   * children): normal progress, not news for Linear. Waiting for a sibling,
+   * like a fix task, is still news.
    */
   internal: boolean;
   /** Last thing the assignee wrote, trimmed. */
@@ -103,6 +104,27 @@ export function plainTextAgentNames(body: string, agents: AgentView[]): AgentVie
   return found;
 }
 
+/** Every task's descendants (children, grandchildren…) within the given tasks. */
+export function descendantsOf(tasks: Pick<TaskView, "id" | "parentId">[]): Map<string, Set<string>> {
+  const children = new Map<string, string[]>();
+  for (const task of tasks) {
+    if (task.parentId) children.set(task.parentId, [...(children.get(task.parentId) ?? []), task.id]);
+  }
+  const result = new Map<string, Set<string>>();
+  for (const task of tasks) {
+    const found = new Set<string>();
+    const stack = [...(children.get(task.id) ?? [])];
+    while (stack.length > 0) {
+      const id = stack.pop()!;
+      if (found.has(id)) continue;
+      found.add(id);
+      stack.push(...(children.get(id) ?? []));
+    }
+    result.set(task.id, found);
+  }
+  return result;
+}
+
 export function issueIdentifiers(text: string): string[] {
   return [...new Set([...text.matchAll(ISSUE_IDENTIFIER)].map((match) => match[1].toUpperCase()))];
 }
@@ -123,8 +145,8 @@ export function diagnoseBlocked(input: {
   productLabel: string;
   staleMinutes: number;
   nowMs: number;
-  /** Ids of every task in the synced subtree; blockers inside it make the block internal. */
-  subtreeIds?: Set<string>;
+  /** Ids of the task's own descendants; a block only by them is internal. */
+  descendantIds?: Set<string>;
 }): Diagnosis {
   const { task } = input;
   const lower = (names: string[]) => names.map((name) => name.toLowerCase());
@@ -153,7 +175,9 @@ export function diagnoseBlocked(input: {
 
   const idleMs = input.nowMs - Date.parse(lastActivityAt);
   const stuck = activeBlockers.length === 0 && input.pendingInteractions === 0 && idleMs >= input.staleMinutes * 60_000;
-  const internal = activeBlockers.length > 0 && input.subtreeIds !== undefined && activeBlockers.every((blocker) => input.subtreeIds!.has(blocker.id));
+  // Formal blockers that are all its own subtasks, open or already closed (then Paperclip, or the
+  // silent resume after the grace period, takes it from there).
+  const internal = input.blockers.length > 0 && input.descendantIds !== undefined && input.blockers.every((blocker) => input.descendantIds!.has(blocker.id));
   return {
     taskId: task.id,
     identifier: task.identifier,
@@ -171,51 +195,61 @@ export function diagnoseBlocked(input: {
 export interface FixFollowUps {
   /** Formal relations the text announces but nobody created. */
   missingRelations: Array<{ blockedTaskId: string; blockerTaskId: string }>;
-  /** Blocked tasks whose fix task is done and that nothing else blocks. */
-  resumes: Array<{ taskId: string; fixTaskId: string }>;
+  /**
+   * Blocked tasks whose fix task is done and that nothing else blocks.
+   * `announce`: the link was only written in text, so Paperclip could not
+   * know; worth telling Linear. Formal relations are Paperclip's own
+   * business (often a parent waiting for a subtask) and are healed silently.
+   */
+  resumes: Array<{ taskId: string; fixTaskId: string; announce: boolean }>;
 }
 
 /**
- * The LAB-5055 pattern: a fix task says "blocks LAB-B" (or is a formal
- * blocker of B), finishes, and B stays blocked because nobody told it.
+ * The LAB-5055 pattern: a fix task says "blocks LAB-B", finishes, and B stays
+ * blocked because nobody told it. Resumed right away, since Paperclip cannot
+ * see a link that only exists in text. When the link is a formal relation,
+ * Paperclip gets `graceMs` after the blocker closes to resume B itself.
  */
-export function fixFollowUps(tasks: TaskView[], blockedByIds: Map<string, string[]>): FixFollowUps {
+export function fixFollowUps(tasks: TaskView[], blockedByIds: Map<string, string[]>, nowMs: number, graceMs: number): FixFollowUps {
   const byIdentifier = new Map(tasks.filter((task) => task.identifier).map((task) => [task.identifier!.toUpperCase(), task]));
   const byId = new Map(tasks.map((task) => [task.id, task]));
   const missingRelations: FixFollowUps["missingRelations"] = [];
   const resumes: FixFollowUps["resumes"] = [];
-  const pairs = new Map<string, { blocked: TaskView; fix: TaskView; formal: boolean }>();
+  const pairs = new Map<string, { blocked: TaskView; fix: TaskView; formal: boolean; textual: boolean }>();
 
   for (const fix of tasks) {
     for (const reference of blocksReferences(fix)) {
       const blocked = byIdentifier.get(reference);
       if (!blocked || blocked.id === fix.id) continue;
       const formal = (blockedByIds.get(blocked.id) ?? []).includes(fix.id);
-      pairs.set(`${blocked.id}|${fix.id}`, { blocked, fix, formal });
+      pairs.set(`${blocked.id}|${fix.id}`, { blocked, fix, formal, textual: true });
     }
   }
   for (const [blockedId, blockerIds] of blockedByIds) {
     const blocked = byId.get(blockedId);
     for (const blockerId of blockerIds) {
       const fix = byId.get(blockerId);
-      if (blocked && fix) pairs.set(`${blocked.id}|${fix.id}`, { blocked, fix, formal: true });
+      const key = `${blockedId}|${blockerId}`;
+      if (blocked && fix && !pairs.has(key)) pairs.set(key, { blocked, fix, formal: true, textual: false });
+      else if (pairs.has(key)) pairs.get(key)!.formal = true;
     }
   }
 
-  for (const { blocked, fix, formal } of pairs.values()) {
+  for (const { blocked, fix, formal, textual } of pairs.values()) {
     if (isClosed(blocked.status)) continue;
     if (!formal && !isClosed(fix.status)) {
       missingRelations.push({ blockedTaskId: blocked.id, blockerTaskId: fix.id });
       continue;
     }
     if (fix.status !== "done" || blocked.status !== "blocked") continue;
+    if (formal && nowMs - Date.parse(fix.updatedAt) < graceMs) continue;
     const otherActive = (blockedByIds.get(blocked.id) ?? [])
       .filter((id) => id !== fix.id)
       .some((id) => {
         const other = byId.get(id);
         return other === undefined || !isClosed(other.status);
       });
-    if (!otherActive) resumes.push({ taskId: blocked.id, fixTaskId: fix.id });
+    if (!otherActive) resumes.push({ taskId: blocked.id, fixTaskId: fix.id, announce: textual && !formal });
   }
   return { missingRelations, resumes };
 }
@@ -272,6 +306,8 @@ export const emptyPublished = (): PublishedState => ({ baseline: false, blocked:
 /** A block Linear should hear about: not waiting for a prototype merge, not a parent waiting for its own subtasks. */
 export const isNews = (diagnosis: Diagnosis) => !diagnosis.excluded && !diagnosis.internal;
 
+const ADOPTED = "adopted:";
+
 export type Notice =
   | { kind: "block"; diagnosis: Diagnosis; episode: string }
   | { kind: "unblock"; taskId: string; episode: string }
@@ -296,7 +332,8 @@ export function planNotices(input: {
 
   for (const diagnosis of current) {
     const known = input.published.blocked[diagnosis.taskId];
-    const episode = known ?? `${diagnosis.taskId}@${input.nowIso}`;
+    // Adopted episodes were never announced, so their unblock is not announced either.
+    const episode = known ?? `${firstPass ? ADOPTED : ""}${diagnosis.taskId}@${input.nowIso}`;
     next.blocked[diagnosis.taskId] = episode;
     if (!known && !firstPass) notices.push({ kind: "block", diagnosis, episode });
     if (diagnosis.stuck) {
@@ -307,7 +344,7 @@ export function planNotices(input: {
   }
   if (!firstPass) {
     for (const [taskId, episode] of Object.entries(input.published.blocked)) {
-      if (!(taskId in next.blocked)) notices.push({ kind: "unblock", taskId, episode });
+      if (!(taskId in next.blocked) && !episode.startsWith(ADOPTED)) notices.push({ kind: "unblock", taskId, episode });
     }
   }
   if (input.rootsDone && !input.published.done) {

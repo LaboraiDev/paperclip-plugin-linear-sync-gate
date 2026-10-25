@@ -254,6 +254,27 @@ describe("N10 and N11 self-healing", () => {
     expect(relations.blockedBy.map((blocker) => blocker.id)).toEqual(["f"]);
   });
 
+  it("a parent whose formal subtask finished: nothing in Linear, and a silent resume only after the grace period", async () => {
+    linear.addIssue({ id: "lin-9", identifier: "DEV-9" });
+    const harness = await harnessWith({
+      tasks: [
+        task({ id: "root", description: linearLink("DEV-9"), status: "in_progress" }),
+        task({ id: "parent", identifier: "LAB-1", parentId: "root", status: "blocked", assigneeAgentId: "agent-cto", updatedAt: "2026-10-25T17:50:00Z" }),
+        task({ id: "sub", identifier: "LAB-2", parentId: "parent", status: "done", assigneeAgentId: "agent-dev", updatedAt: "2026-10-25T17:55:00Z" }),
+      ],
+    });
+    await harness.ctx.issues.relations.setBlockedBy("parent", ["sub"], COMPANY);
+    await sweep(harness); // baseline
+    await sweep(harness);
+    expect(await statusOf(harness, "parent")).toBe("blocked");
+
+    at("2026-10-25T18:30:00Z");
+    await sweep(harness);
+    expect(await statusOf(harness, "parent")).toBe("todo");
+    expect((await commentsOn(harness, "parent")).some((entry) => entry.body.includes("linear-sync:resume:"))).toBe(true);
+    expect(linear.appComments("lin-9")).toEqual([]);
+  });
+
   it("re-mentions an agent named in plain text and wakes its blocked task", async () => {
     linear.addIssue({ id: "lin-8", identifier: "DEV-8" });
     const harness = await harnessWith({
@@ -412,6 +433,35 @@ describe("N7, N8 comments both ways", () => {
     expect(relayed!.body).toContain("aquí aparece con otra cuenta");
   });
 
+  it("does not lift a block that waits on another agent: the comment wakes the assignee, the status stays", async () => {
+    linear.addIssue({ id: "lin-22", identifier: "DEV-22" });
+    const harness = await harnessWith({
+      tasks: [
+        task({ id: "root", description: linearLink("DEV-22"), status: "in_progress", assigneeAgentId: "agent-ceo" }),
+        task({ id: "child", identifier: "LAB-22", parentId: "root", status: "blocked", assigneeAgentId: "agent-dev", updatedAt: T0 }),
+      ],
+      comments: [comment("c1", "child", "Waiting for [CTO Backend](agent://agent-cto) to approve.", { agent: "agent-dev" }, T0)],
+    });
+    await sweep(harness); // baseline
+    at("2026-10-25T18:10:00Z");
+    linear.find("lin-22")!.comments.push({ id: "lc-3", body: "Gracias", createdAt: "2026-10-25T18:09:00Z", parentId: null, user: { id: "u-eros", name: "Eros", email: "eros@x.com" } });
+    await sweep(harness);
+    expect((await commentsOn(harness, "child")).some((entry) => entry.body.includes("linear-sync:relay:lc-3"))).toBe(true);
+    expect(await statusOf(harness, "child")).toBe("blocked");
+  });
+
+  it("reads past the first 100 Linear comments", async () => {
+    const harness = await waitingForHuman();
+    const issue = linear.find("lin-20")!;
+    for (let index = 0; index < 150; index += 1) {
+      issue.comments.push({ id: `bot-${index}`, body: "nota", createdAt: "2026-10-25T17:00:00Z", parentId: null, user: { ...{ id: "app", name: "Paperclip" }, email: null } });
+    }
+    at("2026-10-25T18:10:00Z");
+    humanComment("lc-151", { id: "u-eros", name: "Eros", email: "eros@x.com" }, "2026-10-25T18:09:00Z");
+    await sweep(harness);
+    expect((await commentsOn(harness, "child")).some((entry) => entry.body.includes("linear-sync:relay:lc-151"))).toBe(true);
+  });
+
   it("does not relay comments that existed before the first pass, nor the app's own", async () => {
     linear.addIssue({ id: "lin-21", identifier: "DEV-21" });
     linear.find("lin-21")!.comments.push({ id: "old", body: "Comentario antiguo", createdAt: "2026-10-20T10:00:00Z", parentId: null, user: { id: "u-eros", name: "Eros", email: "eros@x.com" } });
@@ -462,9 +512,13 @@ describe("N13, N14 triggers", () => {
       plugin.definition.onWebhook!({ endpointKey: LINEAR_WEBHOOK_KEY, headers: { "linear-signature": signature }, rawBody, parsedBody: JSON.parse(rawBody), requestId: "r1" });
 
     await deliver(createHmac("sha256", "wrong").update(rawBody).digest("hex"));
+    await drainEvents();
     expect((await commentsOn(harness, "root")).some((entry) => entry.body.includes("linear-sync:relay:lc-9"))).toBe(false);
 
+    // Linear gives up after 5 s: the delivery only verifies and queues; the pass runs afterwards.
     await deliver(createHmac("sha256", WEBHOOK_SECRET).update(rawBody).digest("hex"));
+    expect((await commentsOn(harness, "root")).some((entry) => entry.body.includes("linear-sync:relay:lc-9"))).toBe(false);
+    await drainEvents();
     expect((await commentsOn(harness, "root")).some((entry) => entry.body.includes("linear-sync:relay:lc-9"))).toBe(true);
   });
 });

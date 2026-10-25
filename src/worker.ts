@@ -46,28 +46,44 @@ async function withSync<T>(ctx: PluginContext, companyId: string, work: (sync: S
   });
 }
 
+// Work queued by Paperclip events and Linear webhooks, per company. Webhooks
+// only verify and queue: Linear gives up on a delivery after 5 seconds and may
+// disable a webhook that keeps timing out, and a pass can wait behind a sweep.
 const pendingTasks = new Map<string, Set<string>>();
+const pendingLinear = new Map<string, Map<string, LinearWebhookPayload>>();
 const timers = new Map<string, ReturnType<typeof setTimeout>>();
 
-async function processEvents(companyId: string): Promise<void> {
+function schedule(companyId: string): void {
+  if (!timers.has(companyId)) timers.set(companyId, setTimeout(() => void processQueued(companyId), EVENT_DEBOUNCE_MS));
+}
+
+async function processQueued(companyId: string): Promise<void> {
   const timer = timers.get(companyId);
   if (timer) clearTimeout(timer);
   timers.delete(companyId);
   const taskIds = [...(pendingTasks.get(companyId) ?? [])];
+  const webhooks = [...(pendingLinear.get(companyId)?.values() ?? [])];
   pendingTasks.delete(companyId);
-  if (taskIds.length === 0 || !context) return;
+  pendingLinear.delete(companyId);
+  if ((taskIds.length === 0 && webhooks.length === 0) || !context) return;
   const ctx = context;
   try {
-    await serialize(companyId, () => withSync(ctx, companyId, (sync) => handleTaskEvents(sync, taskIds)));
+    await serialize(companyId, () =>
+      withSync(ctx, companyId, async (sync) => {
+        if (taskIds.length > 0) await handleTaskEvents(sync, taskIds);
+        for (const payload of webhooks) await handleLinearWebhook(sync, payload);
+      }),
+    );
   } catch (error) {
     // The sweep reconciles the same issues within 5 minutes.
-    ctx.logger.warn("Linear sync event pass failed; the sweep will retry", { companyId, error: error instanceof Error ? error.message : String(error) });
+    ctx.logger.warn("Linear sync queued pass failed; the sweep will retry", { companyId, error: error instanceof Error ? error.message : String(error) });
   }
 }
 
-/** Run every queued event pass now instead of waiting for the debounce (tests). */
+/** Run every queued pass now instead of waiting for the debounce (tests). */
 export async function drainEvents(): Promise<void> {
-  await Promise.all([...new Set([...pendingTasks.keys(), ...timers.keys()])].map((companyId) => processEvents(companyId)));
+  const companies = new Set([...pendingTasks.keys(), ...pendingLinear.keys(), ...timers.keys()]);
+  await Promise.all([...companies].map((companyId) => processQueued(companyId)));
 }
 
 function header(headers: Record<string, string | string[]>, name: string): string | null {
@@ -100,9 +116,7 @@ const plugin = definePlugin({
         const queued = pendingTasks.get(event.companyId) ?? new Set<string>();
         queued.add(event.entityId);
         pendingTasks.set(event.companyId, queued);
-        if (!timers.has(event.companyId)) {
-          timers.set(event.companyId, setTimeout(() => void processEvents(event.companyId), EVENT_DEBOUNCE_MS));
-        }
+        schedule(event.companyId);
       });
     }
   },
@@ -118,11 +132,13 @@ const plugin = definePlugin({
       if ("skip" in parsed || !parsed.config.linearWebhookSecret) continue;
       const secret = await ctx.secrets.resolve(parsed.config.linearWebhookSecret, { companyId: company.id, configPath: "linearWebhookSecret" });
       if (!verifyLinearSignature({ rawBody: input.rawBody, signature, secret, webhookTimestamp: payload.webhookTimestamp, nowMs: Date.now() })) continue;
-      try {
-        await serialize(company.id, () => withSync(ctx, company.id, (sync) => handleLinearWebhook(sync, payload)));
-      } catch (error) {
-        ctx.logger.warn("Linear webhook pass failed; the sweep will retry", { companyId: company.id, error: error instanceof Error ? error.message : String(error) });
-      }
+      const issueId = payload.type === "Comment" ? payload.data?.issueId : payload.data?.id;
+      if (!issueId) return;
+      const queued = pendingLinear.get(company.id) ?? new Map<string, LinearWebhookPayload>();
+      // Issue deliveries may take new work in; keep that kind if both arrive for one issue.
+      if (queued.get(issueId)?.type !== "Issue") queued.set(issueId, payload);
+      pendingLinear.set(company.id, queued);
+      schedule(company.id);
       return;
     }
     ctx.logger.warn("Linear webhook rejected: no enabled company's secret matches the signature", { requestId: input.requestId });

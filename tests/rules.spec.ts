@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   blocksReferences,
+  descendantsOf,
   diagnoseBlocked,
   emptyPublished,
   fixFollowUps,
@@ -114,26 +115,45 @@ describe("blocksReferences", () => {
 
 describe("fixFollowUps", () => {
   const blocked = task({ id: "b", identifier: "LAB-5055", status: "blocked", assigneeAgentId: "agent-dev" });
+  const GRACE = 30 * 60_000;
+  const follow = (tasks: TaskView[], relations: Map<string, string[]>, nowMs = NOW) => fixFollowUps(tasks, relations, nowMs, GRACE);
 
-  it("LAB-5059: a finished fix that says 'blocks LAB-5055' resumes it even without the formal relation", () => {
-    const fix = task({ id: "f", identifier: "LAB-5059", title: "Fix 3 test defects (blocks LAB-5055)", status: "done" });
-    expect(fixFollowUps([blocked, fix], new Map())).toEqual({ missingRelations: [], resumes: [{ taskId: "b", fixTaskId: "f" }] });
+  it("LAB-5059: a finished fix that says 'blocks LAB-5055' resumes it at once and is announced", () => {
+    const fix = task({ id: "f", identifier: "LAB-5059", title: "Fix 3 test defects (blocks LAB-5055)", status: "done", updatedAt: "2026-10-25T17:59:00Z" });
+    expect(follow([blocked, fix], new Map())).toEqual({ missingRelations: [], resumes: [{ taskId: "b", fixTaskId: "f", announce: true }] });
   });
 
   it("creates the missing relation while the fix is still open", () => {
     const fix = task({ id: "f", identifier: "LAB-5059", title: "Fix (blocks LAB-5055)", status: "in_progress" });
-    expect(fixFollowUps([blocked, fix], new Map())).toEqual({ missingRelations: [{ blockedTaskId: "b", blockerTaskId: "f" }], resumes: [] });
+    expect(follow([blocked, fix], new Map())).toEqual({ missingRelations: [{ blockedTaskId: "b", blockerTaskId: "f" }], resumes: [] });
   });
 
   it("does not resume while another blocker is still open", () => {
     const fix = task({ id: "f", identifier: "LAB-5059", status: "done" });
     const other = task({ id: "o", identifier: "LAB-6000", status: "in_progress" });
-    expect(fixFollowUps([blocked, fix, other], new Map([["b", ["f", "o"]]])).resumes).toEqual([]);
+    expect(follow([blocked, fix, other], new Map([["b", ["f", "o"]]])).resumes).toEqual([]);
   });
 
-  it("resumes on a formal relation whose blocker finished", () => {
-    const fix = task({ id: "f", identifier: "LAB-5059", status: "done" });
-    expect(fixFollowUps([blocked, fix], new Map([["b", ["f"]]])).resumes).toEqual([{ taskId: "b", fixTaskId: "f" }]);
+  it("gives Paperclip the grace period on a formal relation, then resumes silently", () => {
+    const fix = task({ id: "f", identifier: "LAB-5059", status: "done", updatedAt: "2026-10-25T17:45:00Z" });
+    expect(follow([blocked, fix], new Map([["b", ["f"]]])).resumes).toEqual([]);
+    expect(follow([blocked, fix], new Map([["b", ["f"]]]), Date.parse("2026-10-25T18:16:00Z")).resumes).toEqual([{ taskId: "b", fixTaskId: "f", announce: false }]);
+  });
+
+  it("a 'blocks' text that is also a formal relation is Paperclip's to handle first", () => {
+    const fix = task({ id: "f", identifier: "LAB-5059", title: "Fix (blocks LAB-5055)", status: "done", updatedAt: "2026-10-25T17:59:00Z" });
+    expect(follow([blocked, fix], new Map([["b", ["f"]]])).resumes).toEqual([]);
+  });
+});
+
+describe("internal blocks", () => {
+  it("a parent waiting for its own subtask is internal; a task waiting for a sibling is not", () => {
+    const tasks = [task({ id: "p" }), task({ id: "c1", parentId: "p" }), task({ id: "c2", parentId: "p" }), task({ id: "g", parentId: "c1" })];
+    const descendants = descendantsOf(tasks);
+    expect([...descendants.get("p")!].sort()).toEqual(["c1", "c2", "g"]);
+    const open = (id: string) => ({ id, identifier: id, status: "in_progress", assigneeAgentId: null, labelNames: [] });
+    expect(diagnose({ task: task({ id: "p", status: "blocked" }), blockers: [open("c1")], descendantIds: descendants.get("p") }).internal).toBe(true);
+    expect(diagnose({ task: task({ id: "c2", status: "blocked" }), blockers: [open("c1")], descendantIds: descendants.get("c2") }).internal).toBe(false);
   });
 });
 
@@ -192,6 +212,11 @@ describe("planNotices", () => {
     const { notices, next } = planNotices({ diagnoses: [blockedDiagnosis("c")], rootsDone: false, published, nowIso });
     expect(notices.map((notice) => notice.kind).sort()).toEqual(["block", "unblock"]);
     expect(planNotices({ diagnoses: [blockedDiagnosis("c")], rootsDone: false, published: next, nowIso }).notices).toEqual([]);
+  });
+
+  it("does not announce the unblock of a block that was only adopted, never announced", () => {
+    const first = planNotices({ diagnoses: [blockedDiagnosis("a")], rootsDone: false, published: emptyPublished(), nowIso });
+    expect(planNotices({ diagnoses: [], rootsDone: false, published: first.next, nowIso }).notices).toEqual([]);
   });
 
   it("never announces excluded tasks", () => {
