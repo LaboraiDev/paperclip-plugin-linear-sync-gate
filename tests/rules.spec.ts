@@ -8,6 +8,7 @@ import {
   mentionEmails,
   plainTextAgentNames,
   plainTextHandoffs,
+  planLabel,
   planNotices,
   relayTarget,
   type CommentView,
@@ -143,6 +144,28 @@ describe("fixFollowUps", () => {
   it("a 'blocks' text that is also a formal relation is Paperclip's to handle first", () => {
     const fix = task({ id: "f", identifier: "LAB-5059", title: "Fix (blocks LAB-5055)", status: "done", updatedAt: "2026-10-25T17:59:00Z" });
     expect(follow([blocked, fix], new Map([["b", ["f"]]])).resumes).toEqual([]);
+  });
+});
+
+describe("planLabel (option A: the plugin only removes what it owns)", () => {
+  const base = { open: true, owned: false, legacyChecked: true };
+
+  it("adds and owns the label for a real block", () => {
+    expect(planLabel({ ...base, want: true, has: false })).toEqual({ action: "add", owned: true });
+  });
+
+  it("removes only a label it owns", () => {
+    expect(planLabel({ ...base, want: false, has: true, owned: true })).toEqual({ action: "remove", owned: false });
+    expect(planLabel({ ...base, want: false, has: true, owned: false })).toEqual({ action: null, owned: false });
+  });
+
+  it("once per issue: adopts a leftover that matches a block, removes one that does not", () => {
+    expect(planLabel({ ...base, legacyChecked: false, want: true, has: true })).toEqual({ action: null, owned: true });
+    expect(planLabel({ ...base, legacyChecked: false, want: false, has: true })).toEqual({ action: "remove-legacy", owned: false });
+  });
+
+  it("never touches a closed issue's label", () => {
+    expect(planLabel({ ...base, open: false, owned: true, want: false, has: true })).toEqual({ action: null, owned: true });
   });
 });
 

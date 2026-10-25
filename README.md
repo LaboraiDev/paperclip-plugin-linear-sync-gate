@@ -10,7 +10,8 @@ Mantiene Linear y Paperclip sincronizados **sin LLM**. Linear es la interfaz: na
 |---|---|---|
 | Entrada | Linear → Paperclip | Issue en `Todo` + «Ready for AI» → pasa a `In Progress` y se crea la tarea (asignada a la Programing CEO, proyecto según etiqueta Backend/Frontend) con el enlace guardado |
 | Bloqueos | Paperclip → Linear | Cualquier tarea bloqueada del subárbol, de cualquier agente → comentario (motivo, a qué espera, desde cuándo) + etiqueta `Blocked`. Si hace falta una persona, la menciona según `routing` |
-| Desbloqueos | Paperclip → Linear | Comentario; `Blocked` se quita cuando ya no queda nada bloqueado |
+| Desbloqueos | Paperclip → Linear | Comentario; `Blocked` se quita cuando ya no queda nada bloqueado, solo si la puso (o adoptó) el plugin |
+| Etiquetas antiguas | Linear | Una sola vez por issue: una `Blocked` que ya estaba se adopta si hay un bloqueo real, o se quita con un comentario si no lo hay. Una `Blocked` que una persona pone después no se toca nunca |
 | Terminado | Paperclip → Linear | Comentario cuando todas las raíces enlazadas están en `done` (el estado de Linear no se toca) |
 | Comentarios | Linear → Paperclip | Cada comentario humano nuevo llega a la tarea que espera a una persona (o la bloqueada más reciente, o la raíz) como comentario de esa persona, lo que despierta a su agente |
 | Respuestas | Paperclip → Linear | La primera respuesta del agente tras ese comentario vuelve al mismo hilo de Linear |

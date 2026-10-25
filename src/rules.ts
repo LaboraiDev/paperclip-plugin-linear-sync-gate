@@ -299,9 +299,42 @@ export interface PublishedState {
   done: boolean;
   /** createdAt of the newest Linear comment already relayed to Paperclip. */
   relayCursor: string | null;
+  /** The plugin put (or adopted) the Blocked label, so it may take it off. A label a person adds is never removed. */
+  labelOwned?: boolean;
+  /** The one-time cleanup of a Blocked label left by the old routine already ran. */
+  legacyLabelChecked?: boolean;
 }
 
-export const emptyPublished = (): PublishedState => ({ baseline: false, blocked: {}, stuck: {}, done: false, relayCursor: null });
+export const emptyPublished = (): PublishedState => ({
+  baseline: false,
+  blocked: {},
+  stuck: {},
+  done: false,
+  relayCursor: null,
+  labelOwned: false,
+  legacyLabelChecked: false,
+});
+
+export type LabelAction = "add" | "remove" | "remove-legacy" | null;
+
+/**
+ * Who owns the Blocked label (option A, chosen 25/10/2026): the plugin only
+ * removes a label it put or adopted. Once per issue, a label already there is
+ * either adopted (Paperclip has a real block) or removed as a leftover (it
+ * has none). A label a person adds later is left alone.
+ */
+export function planLabel(input: { want: boolean; has: boolean; open: boolean; owned: boolean; legacyChecked: boolean }): {
+  action: LabelAction;
+  owned: boolean;
+} {
+  const { want, has, open, owned, legacyChecked } = input;
+  if (want && !has) return { action: "add", owned: true };
+  if (want && has) return { action: null, owned: owned || !legacyChecked };
+  if (!has || !open) return { action: null, owned: has ? owned : false };
+  if (owned) return { action: "remove", owned: false };
+  if (!legacyChecked) return { action: "remove-legacy", owned: false };
+  return { action: null, owned: false };
+}
 
 /** A block Linear should hear about: not waiting for a prototype merge, not a parent waiting for its own subtasks. */
 export const isNews = (diagnosis: Diagnosis) => !diagnosis.excluded && !diagnosis.internal;

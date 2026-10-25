@@ -44,6 +44,7 @@ Lo que el arnés de tests del SDK **no** puede probar:
 6. Durante 24–48 h, revisar:
    - logs «Linear sync (observe): would apply» y el estado `observed`;
    - el número de la primera pasada («adopted the current state…»);
+   - cuántas etiquetas `Blocked` antiguas se quitarían (`linear.labels` con clave `…:legacy` en `observed`);
    - que LAB-5055 aparece como reanudación, si sigue atascada;
    - que no hay avisos de tareas padre que solo esperan a sus subtareas;
    - una mención de prueba en una issue de prueba → «would apply … paperclip.comment».

@@ -69,6 +69,10 @@ export function resumedNotice(input: { task: TaskRef; cause: string; key: string
   return `**Reanudada automáticamente:** ${ref(input.task)}\n**Por qué:** ${input.cause}\n${marker("resumed", input.key)}`;
 }
 
+export function legacyLabelNotice(input: { blockedLabel: string; key: string }): string {
+  return `Quito la etiqueta «${input.blockedLabel}»: en Paperclip no hay nada bloqueado en esta issue. Era un resto del sistema anterior. Si alguien la vuelve a poner a mano, no la tocaré.\n${marker("legacy-label", input.key)}`;
+}
+
 export function doneNotice(input: { roots: TaskRef[]; episode: string }): string {
   return `**Terminado en Paperclip:** ${input.roots.map(ref).join(", ")} ya está cerrado. Falta que una persona lo revise y cierre esta issue.\n${marker("done", input.episode)}`;
 }

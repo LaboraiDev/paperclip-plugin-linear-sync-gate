@@ -16,6 +16,7 @@ import {
   isClosed,
   isNews,
   mentionEmails,
+  planLabel,
   planNotices,
   plainTextHandoffs,
   relayTarget,
@@ -29,6 +30,7 @@ import {
   blockNotice,
   doneNotice,
   handoffComment,
+  legacyLabelNotice,
   noTaskReply,
   relayToPaperclip,
   replyToLinear,
@@ -495,20 +497,45 @@ export async function reconcileLinearIssue(sync: SyncContext, linearIssueId: str
     }
   }
 
-  // 6. The Blocked label follows the subtree (after the first pass, and never on closed Linear issues).
+  // 6. The Blocked label (after the first pass; never removed from closed issues nor when a person put it).
+  let labelOwned = published.labelOwned ?? false;
+  let legacyLabelChecked = published.legacyLabelChecked ?? false;
   if (!firstPass) {
-    const wantLabel = effective.some((diagnosis) => isNews(diagnosis) && !resumed.has(diagnosis.taskId));
-    const hasLabel = linearIssue.labels.nodes.some((label) => label.name.toLowerCase() === config.blockedLabel.toLowerCase());
-    const open = !["completed", "canceled"].includes(linearIssue.state.type);
-    if (wantLabel !== hasLabel && (wantLabel || open)) {
-      await runner.run({
-        kind: "linear.labels",
-        key: `labels:${linearIssueId}:${wantLabel ? "add" : "remove"}`,
-        linearIssueId,
-        add: wantLabel ? [config.blockedLabel] : [],
-        remove: wantLabel ? [] : [config.blockedLabel],
-        repeatable: true,
-      });
+    const label = planLabel({
+      want: effective.some((diagnosis) => isNews(diagnosis) && !resumed.has(diagnosis.taskId)),
+      has: linearIssue.labels.nodes.some((node) => node.name.toLowerCase() === config.blockedLabel.toLowerCase()),
+      open: !["completed", "canceled"].includes(linearIssue.state.type),
+      owned: labelOwned,
+      legacyChecked: legacyLabelChecked,
+    });
+    let applied = true;
+    if (label.action === "add" || label.action === "remove") {
+      applied = succeeded(
+        await runner.run({
+          kind: "linear.labels",
+          key: `labels:${linearIssueId}:${label.action}`,
+          linearIssueId,
+          add: label.action === "add" ? [config.blockedLabel] : [],
+          remove: label.action === "remove" ? [config.blockedLabel] : [],
+          repeatable: true,
+        }),
+      );
+    } else if (label.action === "remove-legacy") {
+      applied = succeeded(
+        await runner.run({ kind: "linear.labels", key: `labels:${linearIssueId}:legacy`, linearIssueId, add: [], remove: [config.blockedLabel], repeatable: true }),
+      );
+      if (applied) {
+        await runner.run({
+          kind: "linear.comment",
+          key: `legacy-label:${linearIssueId}`,
+          linearIssueId,
+          body: legacyLabelNotice({ blockedLabel: config.blockedLabel, key: linearIssueId }),
+        });
+      }
+    }
+    if (applied) {
+      labelOwned = label.owned;
+      legacyLabelChecked = true;
     }
   }
 
@@ -520,7 +547,10 @@ export async function reconcileLinearIssue(sync: SyncContext, linearIssueId: str
       stuckAnnounced: Object.keys(next.stuck).length,
     });
   }
-  await writeState(ctx, companyId, publishedKey(sync), { ...publishedAll, [linearIssueId]: { ...next, relayCursor } });
+  await writeState(ctx, companyId, publishedKey(sync), {
+    ...publishedAll,
+    [linearIssueId]: { ...next, relayCursor, labelOwned, legacyLabelChecked },
+  });
   await writeState(ctx, companyId, relaysKey(sync), relays);
 }
 

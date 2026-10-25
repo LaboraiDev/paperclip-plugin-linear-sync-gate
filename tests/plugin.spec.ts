@@ -345,7 +345,7 @@ describe("N3, N4, N17 blocks, unblocks and the Blocked label", () => {
     expect(linear.appComments("lin-10")[0].body).toContain("https://linear.app/laborai/profiles/jesus");
   });
 
-  it("removes a stale Blocked label on an open issue, but never on a closed one", async () => {
+  it("A: removes a leftover Blocked label once, explaining why, but never on a closed issue", async () => {
     linear.addIssue({ id: "lin-11", identifier: "DEV-11", labels: ["Ready for AI", "Blocked"] });
     linear.addIssue({ id: "lin-12", identifier: "DEV-12", labels: ["Ready for AI", "Blocked"], stateName: "Done" });
     const harness = await harnessWith({
@@ -358,7 +358,37 @@ describe("N3, N4, N17 blocks, unblocks and the Blocked label", () => {
     expect(linear.find("lin-11")!.labels).toContain("Blocked");
     await sweep(harness);
     expect(linear.find("lin-11")!.labels).not.toContain("Blocked");
+    expect(linear.appComments("lin-11").map((entry) => entry.body).join()).toContain("Era un resto del sistema anterior");
     expect(linear.find("lin-12")!.labels).toContain("Blocked");
+    expect(linear.appComments("lin-12")).toEqual([]);
+  });
+
+  it("A: a Blocked label a person adds afterwards is never removed", async () => {
+    linear.addIssue({ id: "lin-14", identifier: "DEV-14" });
+    const harness = await harnessWith({ tasks: [task({ id: "r14", description: linearLink("DEV-14"), status: "in_progress" })] });
+    await sweep(harness); // baseline
+    await sweep(harness); // one-time check: no label, nothing to clean
+    linear.find("lin-14")!.labels.push("Blocked"); // e.g. waiting for the client
+    await sweep(harness);
+    await sweep(harness);
+    expect(linear.find("lin-14")!.labels).toContain("Blocked");
+    expect(linear.appComments("lin-14")).toEqual([]);
+  });
+
+  it("A: a leftover label that matches a real block is adopted and removed when the block ends", async () => {
+    linear.addIssue({ id: "lin-15", identifier: "DEV-15", labels: ["Ready for AI", "Blocked"] });
+    const harness = await harnessWith({
+      tasks: [
+        task({ id: "r15", description: linearLink("DEV-15"), status: "in_progress" }),
+        task({ id: "c15", identifier: "LAB-15", parentId: "r15", status: "blocked", assigneeAgentId: "agent-dev", updatedAt: T0 }),
+      ],
+    });
+    await sweep(harness); // baseline
+    await sweep(harness); // label adopted: it matches the block
+    expect(linear.find("lin-15")!.labels).toContain("Blocked");
+    await harness.ctx.issues.update("c15", { status: "in_progress" }, COMPANY);
+    await sweep(harness);
+    expect(linear.find("lin-15")!.labels).not.toContain("Blocked");
   });
 
   it("N12 announces a stuck task with nothing blocking it, mentioning the routed person", async () => {
