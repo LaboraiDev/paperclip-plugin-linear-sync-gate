@@ -1,8 +1,8 @@
 {
   "name": "@laboraidev/paperclip-plugin-linear-sync-gate",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
-  "description": "Paperclip plugin: wakes the Linear sync routine only when Linear or Paperclip has pending work.",
+  "description": "Paperclip plugin: keeps Linear and Paperclip in sync without an LLM (intake, blocks, comments both ways, self-healing).",
   "license": "UNLICENSED",
   "repository": {
     "type": "git",

@@ -1,46 +1,62 @@
-# Linear sync gate (plugin de Paperclip)
+# Linear sync (plugin de Paperclip)
 
-Comprueba cada 5 minutos, **sin LLM**, si hay trabajo para la rutina «Linear ↔ Paperclip sync (gated)», y solo entonces la dispara por su webhook. Quien razona y responde sigue siendo el agente de la rutina (Programing CEO).
+Mantiene Linear y Paperclip sincronizados **sin LLM**. Linear es la interfaz: nadie tiene que entrar a Paperclip para ver qué pasa ni para desatascar nada.
 
-## Por qué
+> Hasta la v0.1.0 este plugin solo despertaba a la rutina «Linear ↔ Paperclip sync (gated)». Desde la v0.2.0 hace él la sincronización y la rutina se retira.
 
-Medido en producción el 08/10:
-- 18–20 de cada 20 ejecuciones de la rutina no encontraban nada;
-- cada una costaba ~0,50 USD equivalentes;
-- a 5 minutos serían 288 ejecuciones al día gastando el plan para descubrir que no hay trabajo.
+## Qué hace
 
-## Qué comprueba
-
-| | Fuente | Regla |
+| | Dirección | Qué |
 |---|---|---|
-| A. Menciones pendientes | Linear | Igual que `linear-app-actor.sh pending-mentions --label "Ready for AI"`. Mira las issues con esa etiqueta en triage, unstarted o started. Una mención es un comentario que no es de la app y contiene `@<nombre de la app>` (regex, sin distinguir mayúsculas) o la URL de su perfil. Está pendiente si la última mención es posterior al último comentario de la app |
-| B. Entrada | Linear | Igual que `list --state "Todo" --label "Ready for AI"` |
-| C. Bloqueos nuevos | Paperclip | Tareas del agente que **entran** en `blocked` desde la comprobación anterior, menos las que tienen `awaiting-prototype-merge` (ellas o sus bloqueadores directos). La primera comprobación solo fija la línea base |
+| Entrada | Linear → Paperclip | Issue en `Todo` + «Ready for AI» → pasa a `In Progress` y se crea la tarea (asignada a la Programing CEO, proyecto según etiqueta Backend/Frontend) con el enlace guardado |
+| Bloqueos | Paperclip → Linear | Cualquier tarea bloqueada del subárbol, de cualquier agente → comentario (motivo, a qué espera, desde cuándo) + etiqueta `Blocked`. Si hace falta una persona, la menciona según `routing` |
+| Desbloqueos | Paperclip → Linear | Comentario; `Blocked` se quita cuando ya no queda nada bloqueado |
+| Terminado | Paperclip → Linear | Comentario cuando todas las raíces enlazadas están en `done` (el estado de Linear no se toca) |
+| Comentarios | Linear → Paperclip | Cada comentario humano nuevo llega a la tarea que espera a una persona (o la bloqueada más reciente, o la raíz) como comentario de esa persona, lo que despierta a su agente |
+| Respuestas | Paperclip → Linear | La primera respuesta del agente tras ese comentario vuelve al mismo hilo de Linear |
+| Autoarreglo | Paperclip | Tarea de arreglo terminada que «blocks LAB-X» → reanuda LAB-X. Relación «blocks» escrita pero no creada → la crea. Traspaso que nombra a una agente sin `agent://` → la menciona bien y reanuda su tarea |
+| Atascadas | Paperclip → Linear | Bloqueada, sin nada que la bloquee y sin actividad en `staleMinutes` → un aviso con mención |
 
-**Por qué C usa transiciones:** la rutina no tiene un enlace fijo a la issue de Linear de cada tarea; la deduce leyendo la descripción. Reproducir esa deducción sin LLM daría falsos positivos.
+**No se anuncia:**
+- lo que espera un merge de prototipo (`awaiting-prototype-merge`, en la tarea o en sus bloqueantes directos);
+- una tarea padre que solo espera a sus propias subtareas, porque eso es avance normal.
 
-## Disparo
+## Disparadores
 
-- **Nada pendiente** (A, B y C vacías): no hace nada y gasta 0 tokens.
-- **Algo pendiente:** `POST` al webhook `bearer` de la rutina. El `Idempotency-Key` es la huella del conjunto pendiente más la hora de la comprobación.
-- **Antibucle:** no repite el mismo conjunto antes de `refireMinutes` (60 por defecto).
-- **Entrega no aceptada:** si se fusiona con una ejecución en curso (`coalesced`) o falla, no guarda estado y reintenta en la siguiente comprobación.
-- **Fase de observación:** con el webhook en `setupPending: true`, la respuesta es `test_received` y no se crea ninguna ejecución.
+- **Eventos de Paperclip** (`issue.created`, `issue.updated`, `issue.comment.created`, `issue.relations.updated`): se agrupan 5 s y se reconcilia la issue de Linear afectada.
+- **Webhook de Linear** (`/api/plugins/laboraidev.paperclip-plugin-linear-sync-gate/webhooks/linear`): verificado con `Linear-Signature` (HMAC-SHA256 del cuerpo) y `webhookTimestamp` (60 s).
+- **Barrida cada 5 min**: red de seguridad. Paperclip publica los eventos sin garantía de entrega (`void emit(...)`), así que la barrida es la que asegura el resultado.
 
-## Token de Linear
+Los tres acaban en la misma función (`reconcileLinearIssue`), así que un evento perdido lo arregla la siguiente barrida con la misma lógica.
 
-En cada comprobación se pide un token `client_credentials`, se usa y se revoca. Los permisos tienen que ser **exactamente** los de `linear-app-actor.sh` (`read write app:mentionable`): con otros, Linear revocaría todos los tokens de la app, incluido el del agente.
+## Seguridad
+
+- **Modo `observe`** (por defecto): no escribe nada. Registra cada acción una vez en los logs y en el estado `observed` (últimas 300).
+- **Primera pasada en cada modo = línea base:** adopta lo que ya existe sin anunciarlo y sin tocar etiquetas. Solo lo atascado de verdad se anuncia y se arregla desde el principio.
+- **En Linear solo escribe** comentarios, la etiqueta `Blocked` y `Todo → In Progress` (y su vuelta atrás si falla la creación). Nunca toca una issue cerrada para quitar `Blocked`.
+- **Sin duplicados:** cada acción tiene una clave. Los comentarios de Linear usan un id determinista, como `linear-app-actor.sh`, y los demás se registran como hechos. Todo lo que escribe lleva la marca `<!-- linear-sync:… -->` y se ignora al leer. Los eventos que causa el propio plugin se ignoran.
+- **Una pasada a la vez por compañía.**
+- **Token de Linear:** se pide, se usa y se revoca en cada pasada, con exactamente los permisos de `linear-app-actor.sh` (`read write app:mentionable`).
 
 ## Configuración (por compañía, en Ajustes → Plugins)
 
 | Campo | Valor |
 |---|---|
-| `enabled` | `true` para activar la comprobación |
-| `agentId` | id de Programing CEO |
-| `webhookUrl` | URL del webhook `bearer` de la rutina «(gated)» |
-| `webhookSecret` | Referencia al secreto de ese webhook |
+| `enabled` | `true` para activar |
+| `mode` | `observe` (por defecto) o `act` |
+| `intakeAgentId` | id de la Programing CEO |
 | `linearClientId` / `linearClientSecret` | Los mismos secretos que usa `linear-app-actor` |
-| `readyLabel`, `todoStateName`, `awaitingMergeLabel`, `refireMinutes` | Opcionales; por defecto `Ready for AI`, `Todo`, `awaiting-prototype-merge` y `60` |
+| `linearWebhookSecret` | Secreto de firma del webhook de Linear (opcional: sin él solo corre la barrida) |
+| `relayFallbackUserId` | Usuario de Paperclip al que se atribuyen los comentarios de autores que no están en `userMap` |
+| `userMap` | email de Linear → id de usuario de Paperclip |
+| `projectMap` | etiqueta de Linear → id de proyecto (`Backend` → API, `Frontend` → Frontend) |
+| `routing` | `product`, `technicalByAssignee` y `technicalDefault`: emails a mencionar (ver `references/team-routing.md` del skill) |
+| `manualLinks` | identificador de tarea raíz → identificador de Linear, para raíces sin enlace en la descripción |
+| `paperclipUrl` | p. ej. `https://paperclip.projectllama.cloud`, para enlazar tareas desde Linear |
+| `productLabel` | etiqueta de Paperclip que marca una pregunta de producto/diseño (por defecto `producto`) |
+| `readyLabel`, `todoStateName`, `inProgressStateName`, `blockedLabel`, `awaitingMergeLabel`, `staleMinutes` | Opcionales. Por defecto `Ready for AI`, `Todo`, `In Progress`, `Blocked`, `awaiting-prototype-merge` y `30` |
+
+**Producto o técnico.** La rutina decidía con criterio de un LLM si una pregunta era de producto o técnica. Sin LLM, la señal es la etiqueta `productLabel` en la tarea bloqueada. Si no la tiene, se usa el enrutado técnico.
 
 ## Versión de Paperclip
 

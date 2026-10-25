@@ -1,114 +1,64 @@
-# Despliegue del Linear sync gate
+# Despliegue de Linear sync v0.2.0
 
-**Principio:** la rutina original «Linear ↔ Paperclip sync» (`60ebd6d9…`, revisión 17) no se modifica ni se elimina. Al activar el plugin solo se **pausa**.
+**Principio:** nada se borra. La rutina «Linear ↔ Paperclip sync (gated)» solo se **pausa** al activar el plugin en `act`, y vuelve en 1 minuto si hace falta.
 
-## Verificado contra Paperclip 2026.1005.0 (instancia aislada, misma versión y commit que producción)
+## Ya verificado
 
 | Comprobación | Resultado |
 |---|---|
-| Instalación y carga del plugin | `ready`; 1 tarea registrada en el planificador |
-| Cron `*/5` | Se ejecuta solo (`trigger: schedule`) |
-| Configuración con referencias a secretos | Aceptada y validada contra `instanceConfigSchema` |
-| Resolución de secretos y llamada a Linear con `ctx.http.fetch` | Sí (con credenciales falsas Linear responde 401 y la ejecución queda `failed` con ese mensaje, sin secretos) |
-| Lecturas de Paperclip (`issues.list`, `issues.get`, `issues.relations.get`) | Funcionan. Ojo: `issues.get` **no** trae `blockedBy` en esta versión; se usa `issues.relations.get` |
-| Webhook `bearer` con `setupPending: true` | `202 {"status":"test_received","test":true,"routineStarted":false}` |
-| Respuesta del webhook en modo real (leído en el código del servidor 2026.1005.0, sin disparar) | `202` con la ejecución de la rutina en el nivel superior; `status` puede ser `received`, `issue_created`, `completed`, `coalesced`, `skipped` o `failed`. Solo `received`, `issue_created` y `completed` cuentan como entregadas |
-| `ctx.http.fetch` a `localhost` o IP privada | **Bloqueado por el host (SSRF)**. `webhookUrl` debe ser la URL pública `https://paperclip.projectllama.cloud/api/routine-triggers/public/<id>/fire` (resuelve a IP pública, y el endpoint responde sin login; comprobado con un id inexistente → 404 de Paperclip) |
+| SDK = producción | `@paperclipai/plugin-sdk@2026.1005.0`, construido sobre el commit `467125f`, el que devuelve `/api/health` de producción |
+| Eventos en ese commit | `issue.created`, `issue.updated` (con `status` y `_previous.status` en los dos caminos leídos), `issue.comment.created` (solo 120 caracteres del texto: el plugin lee el comentario completo) e `issue.relations.updated`. Leído en el código público de `467125f` |
+| Ruta de webhooks de plugins en producción | `POST /api/plugins/laboraidev.paperclip-plugin-linear-sync-gate/webhooks/linear` → `400 "Plugin does not have the webhooks.receive capability"` con la v0.1.0. La ruta está activa, es pública y llega al plugin |
+| Firma de Linear | HMAC-SHA256 en hex del cuerpo crudo en `Linear-Signature`, más `webhookTimestamp` dentro de 60 s (documentación de Linear) |
+| Tests | `pnpm typecheck`, `pnpm test` (56 tests, incluido el caso LAB-5055 por barrida y solo por eventos) y `pnpm build` en verde |
 
-No verificado en local (requiere credenciales reales de Linear): las consultas reales a Linear y el disparo extremo a extremo. Eso es justo lo que valida la fase 3.
+## Fase 2 — Instancia aislada construida desde el commit `467125f` (igual que la v0.1.0)
 
-## Fase 1 — Publicar (con OK de Jesús)
+Lo que el arnés de tests del SDK **no** puede probar:
+1. ¿`issue.updated` trae `status` y `_previous.status` en un PATCH normal de estado? Si no, solo se pierde rapidez: la barrida lo corrige.
+2. ¿Un comentario con `actorUserId` despierta al agente asignado? El SDK dice que sí.
+3. ¿`requestWakeup` reanuda una tarea que acaba de pasar de `blocked` a `todo`?
+4. ¿Una llamada de webhook (sin compañía activa) puede leer y escribir tareas con `companyId`? Si no puede, el webhook solo registra y la barrida hace el trabajo en ≤5 min.
 
-1. Crear el repo **privado** `LaboraiDev/paperclip-plugin-linear-sync-gate` en GitHub.
-2. Hacer push de `main`. El workflow `ci` pasa typecheck, tests y build.
-3. Hacer push del tag `v0.1.0`. El workflow publica `@laboraidev/paperclip-plugin-linear-sync-gate@0.1.0` en GitHub Packages con el `GITHUB_TOKEN` del workflow.
+## Fase 3 — Producción en `observe` (necesita tu OK)
 
-## Fase 2 — Instalar en modo prueba
+1. Publicar: `git tag v0.2.0 && git push --tags`. El workflow publica en GitHub Packages.
+2. En el VPS: `paperclipai plugin install @laboraidev/paperclip-plugin-linear-sync-gate --version 0.2.0`. Luego `paperclipai plugin list` debe mostrarlo en `ready`.
+3. Configuración (Ajustes → Plugins → Linear sync, compañía Laborai):
+   - `enabled`: sí;
+   - `mode`: **`observe`**;
+   - `intakeAgentId`: `9b1bf0c0-a074-4661-9214-5f53afa3cfd9` (Programing CEO);
+   - `linearClientId` / `linearClientSecret`: los secretos de `linear-app-actor`;
+   - `relayFallbackUserId`: tu id de usuario de Paperclip;
+   - `userMap`: email de Linear → id de usuario de Paperclip de cada persona;
+   - `projectMap`: `{ "Backend": "a204c0ec-3173-4b83-8cb5-37a6dd6973b9", "Frontend": "9bb55fdb-d075-4c11-9d00-14d1053745e3" }` (los mismos de la rutina);
+   - `routing`: los emails de `references/team-routing.md`;
+   - `paperclipUrl`: `https://paperclip.projectllama.cloud`.
+4. Webhook en Linear (Ajustes → API → Webhooks):
+   - URL `https://paperclip.projectllama.cloud/api/plugins/laboraidev.paperclip-plugin-linear-sync-gate/webhooks/linear`;
+   - recursos: Issues, Comments, Issue labels;
+   - equipo DEV;
+   - guardar el secreto de firma como secreto de Paperclip y ponerlo en `linearWebhookSecret`.
+5. Repetir el `curl` de comprobación. Ahora la respuesta debe ser `200` (el plugin la recibe) y en los logs debe aparecer «Linear webhook rejected: no enabled company's secret matches the signature».
+6. Durante 24–48 h, revisar:
+   - logs «Linear sync (observe): would apply» y el estado `observed`;
+   - el número de la primera pasada («adopted the current state…»);
+   - que LAB-5055 aparece como reanudación, si sigue atascada;
+   - que no hay avisos de tareas padre que solo esperan a sus subtareas;
+   - una mención de prueba en una issue de prueba → «would apply … paperclip.comment».
 
-**Efecto en producción:** el webhook en `setupPending` nunca crea ejecuciones ni despierta al agente. Pero desde que se pone `enabled: true`, el plugin **sí** usa las credenciales reales de la app de Linear: en cada comprobación pide un token y lo revoca. Por eso, antes de activarlo, hay que hacer la comprobación previa.
+## Fase 4 — Activar `act` (necesita tu OK), en este orden
 
-### 2.0 Comprobaciones previas (Jesús, una sola vez)
-
-1. **La revocación de un token no afecta a los demás.** Desde cualquier máquina:
-   ```bash
-   LINEAR_CLIENT_ID=... LINEAR_CLIENT_SECRET=... ./scripts/verify-linear-revoke.sh
-   ```
-   Tiene que terminar en `OK`. Si dice `STOP`, **no se activa**: hay que quitar la revocación del plugin y publicar otra versión.
-2. **El VPS resuelve el dominio a la IP pública.** En el VPS:
-   ```bash
-   getent hosts paperclip.projectllama.cloud
-   ```
-   Tiene que dar `51.75.203.215` (u otra IP pública), no `127.x`, `10.x`, `172.16–31.x` ni `192.168.x`. Si diera una IP privada, el guard SSRF de Paperclip bloquearía el disparo.
-
-### 2.1 Instalar
-
-**En el VPS (Jesús), con el usuario que ejecuta Paperclip:**
-
-```bash
-# ~/.npmrc — token clásico de GitHub con SOLO read:packages
-@laboraidev:registry=https://npm.pkg.github.com
-//npm.pkg.github.com/:_authToken=<TOKEN_READ_PACKAGES>
-
-paperclipai plugin install @laboraidev/paperclip-plugin-linear-sync-gate --version 0.1.0
-paperclipai plugin list   # debe aparecer laboraidev.paperclip-plugin-linear-sync-gate en ready
-```
-
-**Rutina nueva (yo, con tu OK):**
-- «Linear ↔ Paperclip sync (gated)»: copia exacta de la descripción de la revisión 17, mismo agente y mismas políticas.
-- La copia se hace dentro de la página, con una sola llamada que lee la original y crea la nueva, para que el texto no pase por ninguna transcripción.
-- Sin cron activo.
-
-**En la UI (Jesús):**
-1. En la rutina nueva, añadir un disparador **Webhook**:
-   - firma `bearer`;
-   - **dejarlo en modo configuración** (`setupPending`).
-2. Paperclip enseña la URL y el secreto **una sola vez**. Guardar el secreto como secreto de Paperclip (p. ej. `LINEAR_GATE_WEBHOOK`).
-3. En Ajustes → Plugins → Linear sync gate (compañía Laborai), rellenar:
-   - `enabled`: sí
-   - `agentId`: id de Programing CEO (`9b1bf0c0-a074-4661-9214-5f53afa3cfd9`)
-   - `webhookUrl`: la URL **pública** del disparador
-   - `webhookSecret`: `LINEAR_GATE_WEBHOOK`
-   - `linearClientId` / `linearClientSecret`: los mismos secretos que usa `linear-app-actor`
-
-## Fase 3 — Observar 24 h (yo leo; nada cambia)
-
-La rutina original sigue igual, cada 30 minutos. Comparo dos fuentes:
-- **Rutina original:** sus ejecuciones.
-- **Plugin:**
-  - el historial de ejecuciones de su tarea (`/api/plugins/<id>/jobs/<jobId>/runs`);
-  - sus logs («nothing to fire» / «fired … test_received»);
-  - el `lastWebhookDelivery` del disparador.
-
-Criterio:
-- si la original encontró trabajo, el plugin tuvo que disparar;
-- si el plugin no disparó, la original no tuvo que encontrar nada.
-
-Para que la observación pruebe algo aunque el día sea tranquilo:
-- **Mención de prueba (Jesús):** durante la observación, una mención deliberada en una issue de prueba con «Ready for AI». Lo esperado:
-  - en ≤5 min, el `lastWebhookDelivery` del disparador muestra `test_received`;
-  - la rutina original responde en su siguiente pasada.
-- **Ejecuciones de la tarea del plugin:** tienen que salir `succeeded`, no `failed` (un 401 o 403 de Linear, o un error SSRF, aparecen ahí).
-- **Disparos por bloqueos sin enlace a Linear:** contar cuántos disparos `blocked:` corresponden a tareas sin issue de Linear. Hoy hay 15 tareas manuales así, y cada disparo de este tipo es una ejecución de ~0,50 USD para nada. Si salen muchos, se añade un filtro a C antes de activar.
-
-## Fase 4 — Activar (con tu OK), en este orden
-
-1. **Pausar la rutina original.**
-2. En la nueva:
-   - `PATCH /api/routine-triggers/<id>` `{ "setupPending": false }`;
-   - añadir el cron de respaldo `0 */6 * * *` (Europe/Lisbon).
-
-Nunca dos rutinas activas a la vez: se duplicarían las respuestas.
-
-## Fase 5 — e2e (Jesús)
-
-- Una issue de prueba en Todo con «Ready for AI»: en ≤5 min aparece la tarea en Paperclip.
-- Una mención con una pregunta: en ≤5 min el agente responde en el hilo.
+1. Pausar la rutina «Linear ↔ Paperclip sync (gated)» y quitar su cron. Nunca dos sincronizaciones a la vez.
+2. Cambiar `mode` a `act`. La primera pasada en `act` vuelve a ser línea base: no inunda Linear.
+3. Prueba de punta a punta:
+   - pregunta en una issue de prueba → el agente de la tarea responde → la respuesta aparece en el hilo de Linear;
+   - una issue en `Todo` con «Ready for AI» → en ≤5 min (o al instante con el webhook) aparece la tarea en Paperclip.
 
 ## Marcha atrás (1 minuto)
 
-1. Pausar la rutina nueva. Los disparos del plugin devuelven 409 y no crean nada.
-2. `paperclipai plugin disable laboraidev.paperclip-plugin-linear-sync-gate` (o desde la UI).
-3. Reactivar la rutina original: vuelve con su cron `*/30`, su descripción y su historial.
+1. `mode: observe`, o desactivar el plugin.
+2. Reactivar la rutina «(gated)», que no se ha modificado.
 
 ## Actualizaciones de Paperclip
 
